@@ -13,7 +13,13 @@ var (
 	ErrScheduleDeadline = errors.New("schedule deadline exceeded")
 )
 
-var permanentTimer = &time.Timer{C: nil}
+var timersPool = sync.Pool{
+	New: func() interface{} {
+		t := time.NewTimer(time.Hour)
+		t.Stop()
+		return t
+	},
+}
 
 // Task interface
 type Task interface {
@@ -26,26 +32,24 @@ type GoPool struct {
 	wg                *sync.WaitGroup
 	semaphore         chan struct{}
 	queue             chan Task
-	taskTimeout       time.Duration
 	workerIdleTimeout time.Duration
 	ctx               context.Context
 	shutdown          chan struct{}
 }
 
 // New must be called at the beginning of the main
-func New(ctx context.Context, size, queue, spawn int, taskTimeout, workerIdleTimeout time.Duration) (*GoPool, error) {
-	if size <= 0 || size < spawn {
+func New(ctx context.Context, poolSize, queueSize, spawn int, workerIdleTimeout time.Duration) (*GoPool, error) {
+	if poolSize <= 0 || poolSize < spawn {
 		return nil, ErrInvalidSize
 	}
-	if spawn <= 0 && 0 < queue {
+	if spawn <= 0 && 0 < queueSize {
 		return nil, ErrInvalidOptions
 	}
 
 	pool := &GoPool{
 		wg:                &sync.WaitGroup{},
-		semaphore:         make(chan struct{}, size),
-		queue:             make(chan Task, queue),
-		taskTimeout:       taskTimeout,
+		semaphore:         make(chan struct{}, poolSize),
+		queue:             make(chan Task, queueSize),
 		workerIdleTimeout: workerIdleTimeout,
 		ctx:               ctx,
 		shutdown:          make(chan struct{}),
@@ -54,7 +58,7 @@ func New(ctx context.Context, size, queue, spawn int, taskTimeout, workerIdleTim
 	// spawn permanent workers
 	for i := 0; i < spawn; i++ {
 		pool.semaphore <- struct{}{}
-		pool.worker(nil, taskTimeout, 0)
+		worker(pool, nil, 0)
 	}
 
 	return pool, nil
@@ -79,7 +83,7 @@ func (g *GoPool) schedule(task Task, deadline <-chan time.Time) error {
 		return ErrScheduleDeadline
 	case g.queue <- task:
 	case g.semaphore <- struct{}{}:
-		g.worker(task, g.taskTimeout, g.workerIdleTimeout)
+		worker(g, task, g.workerIdleTimeout)
 	}
 
 	return nil
@@ -87,54 +91,71 @@ func (g *GoPool) schedule(task Task, deadline <-chan time.Time) error {
 
 // worker process task from tasks queue
 // self terminates in case idle more then workerIdleTimeout
-func (g *GoPool) worker(task Task, taskTimeout, workerIdleTimeout time.Duration) {
+func worker(g *GoPool, task Task, workerIdleTimeout time.Duration) {
 	g.wg.Add(1)
 
 	go func() { // call wg.Add outside of goroutine to avoid race
 		if task != nil {
-			do(g.ctx, task, taskTimeout, g.shutdown)
+			do(g.ctx, task, g.shutdown)
 		}
 
-		idleTimer := permanentTimer
+		var idleTimer *time.Timer
+		var chTick <-chan time.Time
 		isTemporary := workerIdleTimeout > 0
+		taskDone := make(chan struct{}, 1)
 
 		if isTemporary {
-			idleTimer = time.NewTimer(workerIdleTimeout)
+			idleTimer = timersPool.Get().(*time.Timer)
+			idleTimer.Reset(workerIdleTimeout)
+			chTick = idleTimer.C
+		}
+
+		releaseTimer := func() {
+			if isTemporary {
+				if !idleTimer.Stop() {
+					<-chTick // drain
+				}
+				timersPool.Put(idleTimer)
+			}
+		}
+
+		resetTimer := func() {
+			if isTemporary {
+				// reset timer before next iteration
+				if !idleTimer.Stop() {
+					<-chTick // drain
+				}
+				idleTimer.Reset(workerIdleTimeout)
+			}
 		}
 
 	loop:
 		for {
 			select {
 			case <-g.ctx.Done():
+				releaseTimer()
 				break loop
 			case <-g.shutdown:
+				releaseTimer()
 				break loop
-			case <-idleTimer.C:
+			case <-chTick:
+				idleTimer.Stop()
+				timersPool.Put(idleTimer)
 				break loop
 			case task := <-g.queue:
-				if task == nil {
-					continue
-				}
-
-				ctx, cancel := context.WithTimeout(g.ctx, taskTimeout)
-				done := make(chan struct{})
-
-				task.Do(ctx, done)
+				task.Do(g.ctx, taskDone)
 
 				select {
-				case <-done:
-				case <-ctx.Done():
-				}
-
-				cancel()
-
-				if isTemporary {
-					// reset timer before next iteration
-					if !idleTimer.Stop() {
-						<-idleTimer.C
+				case <-g.ctx.Done():
+				case _, ok := <-taskDone:
+					// kept for backward compatibility with `close(taskDone)`
+					// might be deprecated
+					if !ok {
+						taskDone = make(chan struct{}, 1)
 					}
-					idleTimer.Reset(workerIdleTimeout)
 				}
+
+				resetTimer()
 			}
 		}
 
@@ -143,23 +164,21 @@ func (g *GoPool) worker(task Task, taskTimeout, workerIdleTimeout time.Duration)
 	}()
 }
 
-func do(poolCtx context.Context, task Task, timeout time.Duration, poolDone <-chan struct{}) {
-	ctx, cancel := context.WithTimeout(poolCtx, timeout)
-	done := make(chan struct{})
+func do(poolCtx context.Context, task Task, poolDone <-chan struct{}) {
+	taskDone := make(chan struct{}, 1)
 
-	task.Do(ctx, done)
+	task.Do(poolCtx, taskDone)
 
 	select {
+	case <-poolCtx.Done():
 	case <-poolDone:
-	case <-done:
-	case <-ctx.Done():
+	case <-taskDone:
 	}
-
-	cancel()
 }
 
 // Shutdown notifies workers to stop.
-// Waits until all workers are stopped
+// Waits until all workers are stopped.
+// Doesn't break workers which in processing
 func (g *GoPool) Shutdown() {
 	close(g.shutdown)
 	g.wg.Wait()
