@@ -23,7 +23,7 @@ var timersPool = sync.Pool{
 
 // Task interface
 type Task interface {
-	// done chan must be closed inside Do after a job is done
+	// done chan must receive a value inside Do after a job is done
 	Do(ctx context.Context, done chan<- struct{})
 }
 
@@ -81,6 +81,8 @@ func (g *GoPool) schedule(task Task, deadline <-chan time.Time) error {
 	select {
 	case <-deadline:
 		return ErrScheduleDeadline
+	case <-g.ctx.Done():
+		return g.ctx.Err()
 	case g.queue <- task:
 	case g.semaphore <- struct{}{}:
 		worker(g, task, g.workerIdleTimeout)
